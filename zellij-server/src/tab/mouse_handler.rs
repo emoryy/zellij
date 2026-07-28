@@ -338,19 +338,9 @@ struct MouseEventContext {
     press_owner: Option<MousePressOwner>,
 }
 
-/// A resize does not always move a border by exactly as many cells as were asked for,
-/// because percentages are rounded to whole cells and a border can be blocked by a minimum
-/// pane size. A handful of attempts per mouse event is enough to close that gap.
-const MAX_RESIZE_CORRECTIONS_PER_EVENT: usize = 4;
-
-fn edge_and_delta_to_strategies(
-    edge: PaneEdge,
-    delta_x: isize,
-    delta_y: isize,
-) -> Vec<ResizeStrategy> {
+/// The direction of the pane border each axis of the given edge sits on.
+fn edge_directions(edge: PaneEdge) -> (Option<Direction>, Option<Direction>) {
     use Direction::*;
-    use Resize::*;
-
     let horizontal = match edge {
         PaneEdge::Left | PaneEdge::TopLeft | PaneEdge::BottomLeft => Some(Left),
         PaneEdge::Right | PaneEdge::TopRight | PaneEdge::BottomRight => Some(Right),
@@ -361,6 +351,18 @@ fn edge_and_delta_to_strategies(
         PaneEdge::Bottom | PaneEdge::BottomLeft | PaneEdge::BottomRight => Some(Down),
         PaneEdge::Left | PaneEdge::Right => None,
     };
+    (horizontal, vertical)
+}
+
+fn edge_and_delta_to_strategies(
+    edge: PaneEdge,
+    delta_x: isize,
+    delta_y: isize,
+) -> Vec<ResizeStrategy> {
+    use Direction::*;
+    use Resize::*;
+
+    let (horizontal, vertical) = edge_directions(edge);
 
     // An axis the cursor did not move along is left out entirely, a zero-sized resize would
     // only make the layout solver run for nothing
@@ -748,6 +750,10 @@ impl MouseHandler {
         Ok(())
     }
 
+    fn edge_directions(edge: PaneEdge) -> (Option<Direction>, Option<Direction>) {
+        edge_directions(edge)
+    }
+
     /// The coordinates of the boundaries the given edge sits on, `None` for an axis the edge
     /// does not own.
     fn edge_boundaries(geom: &PaneGeom, edge: PaneEdge) -> (Option<isize>, Option<isize>) {
@@ -837,54 +843,49 @@ impl MouseHandler {
             return Ok(true);
         };
 
-        let mut resized = false;
-        let mut previous_distance = usize::MAX;
-        for _ in 0..MAX_RESIZE_CORRECTIONS_PER_EVENT {
-            let Some((delta_x, delta_y)) = Self::distance_from_edge_to_cursor(
+        let Some((delta_x, delta_y)) =
+            Self::distance_from_edge_to_cursor(tab, pane_id, edge, current_position, grab_offset)
+        else {
+            return Ok(false);
+        };
+        if delta_x == 0 && delta_y == 0 {
+            return Ok(false);
+        }
+
+        let resize_result = if is_floating {
+            let strategies = edge_and_delta_to_strategies(edge, delta_x, delta_y);
+            Self::resize_floating_pane_with_strategies(
                 tab,
                 pane_id,
-                edge,
-                current_position,
-                grab_offset,
-            ) else {
-                break;
-            };
-            let distance = delta_x.unsigned_abs() + delta_y.unsigned_abs();
-            if distance == 0 || distance >= previous_distance {
-                // the edge either arrived, or the previous attempt did not bring it any
-                // closer and another one would only make it oscillate
-                break;
+                &strategies,
+                (delta_x.unsigned_abs(), delta_y.unsigned_abs()),
+            )
+        } else {
+            // one boundary per axis, each moved by exactly the number of cells that puts it
+            // under the cursor
+            let (horizontal, vertical) = Self::edge_directions(edge);
+            let mut moves = vec![];
+            if let Some(direction) = horizontal.filter(|_| delta_x != 0) {
+                moves.push((direction, delta_x));
             }
-            previous_distance = distance;
-
-            let strategies = edge_and_delta_to_strategies(edge, delta_x, delta_y);
-            let resize_result = if is_floating {
-                Self::resize_floating_pane_with_strategies(
-                    tab,
-                    pane_id,
-                    &strategies,
-                    (delta_x.unsigned_abs(), delta_y.unsigned_abs()),
-                )
-            } else {
-                Self::resize_tiled_pane_with_strategies(
-                    tab,
-                    pane_id,
-                    &strategies,
-                    (delta_x.abs() as f64, delta_y.abs() as f64),
-                )
-            };
-            if resize_result.is_err() {
-                tab.pane_being_resized_with_mouse = None;
+            if let Some(direction) = vertical.filter(|_| delta_y != 0) {
+                moves.push((direction, delta_y));
             }
-            resize_result.with_context(err_context)?;
-            resized = true;
+            tab.tiled_panes
+                .move_pane_boundaries(pane_id, &moves)
+                .map(|_| ())
+        };
+        if resize_result.is_err() {
+            tab.pane_being_resized_with_mouse = None;
+        }
+        resize_result.with_context(err_context)?;
+        if !is_floating {
+            tab.swap_layouts.set_is_tiled_damaged();
         }
 
-        if resized {
-            tab.set_force_render();
-        }
+        tab.set_force_render();
 
-        Ok(resized)
+        Ok(true)
     }
 
     fn stop_pane_resize_with_mouse(

@@ -22468,3 +22468,265 @@ pub fn dragged_border_catches_up_with_the_cursor_after_being_blocked() {
     }
     assert_eq!(boundary(&tab), 31);
 }
+
+fn diag_strip_tab(size: Size, panes: usize, ui_rows: bool) -> Tab {
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Horizontal;
+    root.children = (0..panes).map(|_| TiledPaneLayout::default()).collect();
+    if ui_rows {
+        let mut fixed_two = TiledPaneLayout::default();
+        fixed_two.split_size = Some(SplitSize::Fixed(2));
+        let mut fixed_one = TiledPaneLayout::default();
+        fixed_one.split_size = Some(SplitSize::Fixed(1));
+        root.children.push(fixed_two);
+        root.children.push(fixed_one);
+    }
+    create_new_tab_with_layout(size, root)
+}
+
+fn diag_pane_geoms(tab: &Tab) -> Vec<(u32, usize, usize, usize, usize)> {
+    let mut out: Vec<(u32, usize, usize, usize, usize)> = tab
+        .tiled_panes
+        .panes
+        .iter()
+        .map(|(pid, pane)| {
+            let g = pane.position_and_size();
+            let id = match pid {
+                PaneId::Terminal(id) => *id,
+                PaneId::Plugin(id) => *id,
+            };
+            (id, g.x, g.y, g.cols.as_usize(), g.rows.as_usize())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Drag one divider through a range of layouts and terminal sizes and check the panes that
+/// are not adjacent to it: their position and size must not change at all.
+#[test]
+pub fn diag_untouched_panes_during_drag() {
+    let mut cases = 0;
+    let mut cases_with_untouched_moving = 0;
+    let mut events_with_movement = 0;
+    let mut examples: Vec<String> = vec![];
+
+    for panes in [3usize, 4, 5, 6] {
+        for ui_rows in [false, true] {
+            for rows in 24..=70usize {
+                let size = Size { cols: 121, rows };
+                let mut tab = diag_strip_tab(size, panes, ui_rows);
+                let before = diag_pane_geoms(&tab);
+                let (_, ys) = diag_boundaries(&tab);
+                if ys.len() < 4 {
+                    continue;
+                }
+                let dragged = ys[2];
+                let adjacent: Vec<u32> = before
+                    .iter()
+                    .filter(|(_, _, y, _, r)| *y == dragged || y + r == dragged)
+                    .map(|(id, ..)| *id)
+                    .collect();
+                if adjacent.len() != 2 {
+                    continue;
+                }
+                cases += 1;
+                let untouched_before: Vec<_> = before
+                    .iter()
+                    .copied()
+                    .filter(|(id, ..)| !adjacent.contains(id))
+                    .collect();
+
+                tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, 60, dragged as isize), 1)
+                    .unwrap();
+                let mut moved_events = 0;
+                for step in 1..=8 {
+                    let line = dragged as isize - step;
+                    if line < 1 {
+                        break;
+                    }
+                    tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, 60, line), 1)
+                        .unwrap();
+                    let untouched_now: Vec<_> = diag_pane_geoms(&tab)
+                        .into_iter()
+                        .filter(|(id, ..)| !adjacent.contains(id))
+                        .collect();
+                    if untouched_now != untouched_before {
+                        moved_events += 1;
+                        if examples.len() < 4 {
+                            examples.push(format!(
+                                "{} panes{} 121x{} dragging y={}: {:?} became {:?}",
+                                panes,
+                                if ui_rows { " + ui" } else { "" },
+                                rows,
+                                dragged,
+                                untouched_before,
+                                untouched_now
+                            ));
+                        }
+                    }
+                }
+                events_with_movement += moved_events;
+                if moved_events > 0 {
+                    cases_with_untouched_moving += 1;
+                }
+            }
+        }
+    }
+    println!("cases {}", cases);
+    println!(
+        "  cases where an untouched pane moved: {}",
+        cases_with_untouched_moving
+    );
+    println!(
+        "  drag events that moved one:          {}",
+        events_with_movement
+    );
+    for e in &examples {
+        println!("  {}", e);
+    }
+}
+
+/// The grabbed divider must sit exactly on the cursor for as long as the panes it squeezes
+/// have room left.
+#[test]
+pub fn diag_grabbed_divider_tracking() {
+    let mut cases = 0;
+    let mut misses = 0;
+    let mut examples: Vec<String> = vec![];
+    for panes in [3usize, 4, 5, 6] {
+        for ui_rows in [false, true] {
+            for rows in 40..=70usize {
+                let size = Size { cols: 121, rows };
+                let mut tab = diag_strip_tab(size, panes, ui_rows);
+                let (_, ys) = diag_boundaries(&tab);
+                if ys.len() < 4 {
+                    continue;
+                }
+                let dragged = ys[2];
+                let dragged_pane = tab
+                    .tiled_panes
+                    .panes
+                    .iter()
+                    .find(|(_, p)| p.position_and_size().y == dragged)
+                    .map(|(pid, _)| *pid)
+                    .unwrap();
+                cases += 1;
+                tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, 60, dragged as isize), 1)
+                    .unwrap();
+                let mut offsets = vec![];
+                for step in 1..=3 {
+                    let line = dragged as isize - step;
+                    tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, 60, line), 1)
+                        .unwrap();
+                    let y = tab
+                        .tiled_panes
+                        .panes
+                        .get(&dragged_pane)
+                        .unwrap()
+                        .position_and_size()
+                        .y as isize;
+                    offsets.push(y - line);
+                }
+                if offsets.iter().any(|o| *o != 0) {
+                    misses += 1;
+                    if examples.len() < 5 {
+                        examples.push(format!(
+                            "{} panes{} 121x{} dragging y={}: offsets {:?}",
+                            panes,
+                            if ui_rows { " + ui" } else { "" },
+                            rows,
+                            dragged,
+                            offsets
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    println!("tracking cases {}", cases);
+    println!("  drags where the border missed the cursor: {}", misses);
+    for e in &examples {
+        println!("  {}", e);
+    }
+}
+
+/// Four panes in a space that does not divide evenly between them, so their sizes cannot all
+/// be exact: dragging the first divider must still leave the others alone.
+#[test]
+pub fn diag_uneven_strip_drag() {
+    for rows in [30usize, 31, 33, 34, 37, 41, 50] {
+        let size = Size { cols: 121, rows };
+        let mut tab = diag_strip_tab(size, 4, false);
+        let (_, ys) = diag_boundaries(&tab);
+        let separator_y = ys[1];
+        println!("\n=== 121x{} : row boundaries {:?} ===", rows, ys);
+        tab.handle_mouse_event(
+            &diag_mouse(MouseEventType::Press, 60, separator_y as isize),
+            1,
+        )
+        .unwrap();
+        for step in 1..=5 {
+            let line = separator_y as isize - step;
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, 60, line), 1)
+                .unwrap();
+            let (_, ys_now) = diag_boundaries(&tab);
+            println!("  cursor line {:<3} -> {:?}", line, ys_now);
+        }
+        for step in (1..=5).rev() {
+            let line = separator_y as isize - step;
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, 60, line), 1)
+                .unwrap();
+            let (_, ys_now) = diag_boundaries(&tab);
+            println!("  back to line {:<3} -> {:?}", line, ys_now);
+        }
+    }
+}
+
+/// Dragging a divider must move that divider and nothing else.
+#[test]
+pub fn dragging_a_divider_moves_only_that_divider() {
+    for panes in [3usize, 4, 5] {
+        for rows in [26usize, 30, 31, 37, 44, 51] {
+            let size = Size { cols: 121, rows };
+            let mut tab = diag_strip_tab(size, panes, true);
+            let before = diag_pane_geoms(&tab);
+            let (_, ys) = diag_boundaries(&tab);
+            let dragged = ys[2];
+            let adjacent: Vec<u32> = before
+                .iter()
+                .filter(|(_, _, y, _, r)| *y == dragged || y + r == dragged)
+                .map(|(id, ..)| *id)
+                .collect();
+            assert_eq!(
+                adjacent.len(),
+                2,
+                "expected exactly two panes at the divider, {panes} panes 121x{rows}"
+            );
+            let untouched_before: Vec<_> = before
+                .iter()
+                .copied()
+                .filter(|(id, ..)| !adjacent.contains(id))
+                .collect();
+
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, 60, dragged as isize), 1)
+                .unwrap();
+            for step in 1..=6 {
+                let line = dragged as isize - step;
+                if line < 1 {
+                    break;
+                }
+                tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, 60, line), 1)
+                    .unwrap();
+                let untouched_now: Vec<_> = diag_pane_geoms(&tab)
+                    .into_iter()
+                    .filter(|(id, ..)| !adjacent.contains(id))
+                    .collect();
+                assert_eq!(
+                    untouched_now, untouched_before,
+                    "a pane away from the dragged divider moved ({panes} panes 121x{rows}, cursor at line {line})"
+                );
+            }
+        }
+    }
+}

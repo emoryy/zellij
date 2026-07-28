@@ -563,6 +563,216 @@ impl<'a> TiledPaneGrid<'a> {
         Some(space.saturating_sub(fixed_space))
     }
 
+    /// Move the boundary that the given edge of the given pane sits on, by a number of cells
+    /// (negative moves it left/up).
+    ///
+    /// Unlike [`Self::change_pane_size`] this works in cells and writes the new geometry
+    /// directly, so it touches nothing but the panes on the two sides of that one boundary.
+    /// There is no percentage arithmetic to round and no layout-wide constraint solve, which
+    /// is what would otherwise hand a leftover cell to an unrelated pane and make other
+    /// boundaries move at the same time.
+    ///
+    /// Returns how many cells the boundary actually moved: less than asked for when a pane on
+    /// the shrinking side runs into its minimum size.
+    ///
+    /// Takes one move per axis at a time, because which panes sit at a boundary has to be
+    /// worked out from the geometry as it is *before* any of the moves: moving one axis first
+    /// would change the answer for the other one.
+    pub fn move_pane_boundaries(
+        &mut self,
+        pane_id: &PaneId,
+        moves: &[(Direction, isize)],
+    ) -> Result<isize> {
+        let mut plans = vec![];
+        for (edge, cells) in moves {
+            match self.plan_boundary_move(pane_id, *edge, *cells) {
+                Ok(Some(plan)) => plans.push(plan),
+                // a fixed-size pane in the way blocks this axis, the other one can still move
+                Ok(None) | Err(_) => {},
+            }
+        }
+        let mut moved = 0;
+        for (axis, before, after, cells) in plans {
+            for pane_id in before.iter() {
+                self.move_pane_geom(pane_id, axis, 0, cells)?;
+            }
+            for pane_id in after.iter() {
+                self.move_pane_geom(pane_id, axis, cells, -cells)?;
+            }
+            moved += cells.abs();
+        }
+        Ok(moved)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn plan_boundary_move(
+        &self,
+        pane_id: &PaneId,
+        edge: Direction,
+        cells: isize,
+    ) -> Result<Option<(SplitDirection, Vec<PaneId>, Vec<PaneId>, isize)>> {
+        let err_context = || format!("failed to move the {edge} boundary of pane {pane_id:?}");
+        if cells == 0 {
+            return Ok(None);
+        }
+        use Direction as Dir;
+
+        // the panes on the far side of the boundary
+        let mut neighbors = self
+            .pane_ids_directly_next_to(pane_id, &edge)
+            .with_context(err_context)?;
+        if neighbors.is_empty() {
+            return Ok(None);
+        }
+        let neighbor_borders: HashSet<_> = if edge.is_horizontal() {
+            neighbors
+                .iter()
+                .filter_map(|p| self.get_pane_geom(p).map(|p| p.y))
+                .collect()
+        } else {
+            neighbors
+                .iter()
+                .filter_map(|p| self.get_pane_geom(p).map(|p| p.x))
+                .collect()
+        };
+
+        // the panes sharing this pane's edge, ie. the run of panes for which this boundary
+        // exists at all: a boundary further along the same line belongs to other panes and
+        // must not move
+        let (some_direction, other_direction) = match edge {
+            Dir::Left | Dir::Right => (Dir::Up, Dir::Down),
+            Dir::Down | Dir::Up => (Dir::Left, Dir::Right),
+        };
+        let (some_border, some_panes) = self
+            .contiguous_panes_with_alignment(pane_id, &neighbor_borders, &edge, &some_direction)
+            .with_context(err_context)?;
+        let (other_border, other_panes) = self
+            .contiguous_panes_with_alignment(pane_id, &neighbor_borders, &edge, &other_direction)
+            .with_context(err_context)?;
+        neighbors.retain(|t| {
+            if edge.is_horizontal() {
+                self.pane_is_between_horizontal_borders(t, some_border, other_border)
+            } else {
+                self.pane_is_between_vertical_borders(t, some_border, other_border)
+            }
+        });
+        if neighbors.is_empty() {
+            return Ok(None);
+        }
+
+        let mut sharing_the_edge = vec![*pane_id];
+        sharing_the_edge.extend(some_panes);
+        sharing_the_edge.extend(other_panes);
+
+        let (before, after) = match edge {
+            Dir::Right | Dir::Down => (sharing_the_edge, neighbors),
+            Dir::Left | Dir::Up => (neighbors, sharing_the_edge),
+        };
+
+        // a fixed-size pane cannot take part, and neither side can be dragged through it
+        let axis = if edge.is_horizontal() {
+            SplitDirection::Horizontal
+        } else {
+            SplitDirection::Vertical
+        };
+        let fixed_panes: Vec<(u32, bool)> = before
+            .iter()
+            .chain(after.iter())
+            .filter(|p| !self.pane_is_flexible(axis, p).unwrap_or(false))
+            .map(|p| match p {
+                PaneId::Terminal(id) => (*id, true),
+                PaneId::Plugin(id) => (*id, false),
+            })
+            .collect();
+        if !fixed_panes.is_empty() {
+            return Err(ZellijError::CantResizeFixedPanes {
+                pane_ids: fixed_panes,
+            })
+            .with_context(err_context);
+        }
+
+        // clamp to what the shrinking side can give up
+        let shrinking = if cells > 0 { &after } else { &before };
+        let mut room = isize::MAX;
+        for p in shrinking.iter() {
+            let geom = self
+                .get_pane_geom(p)
+                .with_context(|| no_pane_id(p))
+                .with_context(err_context)?;
+            let (size, minimum) = if edge.is_horizontal() {
+                (geom.cols.as_usize(), MIN_TERMINAL_WIDTH)
+            } else if geom.is_stacked() {
+                (
+                    geom.rows.as_usize(),
+                    StackedPanes::new(self.panes.clone()).min_stack_height(p)?,
+                )
+            } else {
+                (geom.rows.as_usize(), MIN_TERMINAL_HEIGHT)
+            };
+            room = room.min(size as isize - minimum as isize);
+        }
+        let cells = if cells > 0 {
+            cells.min(room.max(0))
+        } else {
+            cells.max(-room.max(0))
+        };
+        if cells == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some((axis, before, after, cells)))
+    }
+
+    /// Shift a pane's position and size along one axis by a number of cells, keeping its
+    /// percentage constraint in step with the cells it now occupies so that a later reflow
+    /// (a terminal window resize, say) keeps the proportions the user just set.
+    fn move_pane_geom(
+        &mut self,
+        pane_id: &PaneId,
+        axis: SplitDirection,
+        move_by: isize,
+        grow_by: isize,
+    ) -> Result<()> {
+        let err_context = || format!("failed to move pane {pane_id:?}");
+        let geom = self
+            .get_pane_geom(pane_id)
+            .with_context(|| no_pane_id(pane_id))
+            .with_context(err_context)?;
+        let is_stacked = geom.is_stacked();
+
+        let mut new_geom = geom;
+        let (position, size) = match axis {
+            SplitDirection::Horizontal => (&mut new_geom.x, &mut new_geom.cols),
+            SplitDirection::Vertical => (&mut new_geom.y, &mut new_geom.rows),
+        };
+        *position = position.saturating_add_signed(move_by);
+        let new_size = size.as_usize().saturating_add_signed(grow_by);
+        size.set_inner(new_size);
+        if let Some(flexible_space) = self.flexible_space_for_pane(pane_id, axis) {
+            if flexible_space > 0 && size.is_percent() {
+                size.set_percent((new_size as f64 / flexible_space as f64) * 100.0);
+            }
+        }
+
+        if is_stacked {
+            StackedPanes::new(self.panes.clone())
+                .resize_panes_in_stack(pane_id, new_geom)
+                .with_context(err_context)?;
+        } else {
+            let mut panes = self.panes.borrow_mut();
+            let pane = panes
+                .get_mut(pane_id)
+                .with_context(|| no_pane_id(pane_id))
+                .with_context(err_context)?;
+            if pane.geom_override().is_some() {
+                pane.set_geom_override(new_geom);
+            } else {
+                pane.set_geom(new_geom);
+            }
+        }
+        Ok(())
+    }
+
     fn can_reduce_pane_width(&self, pane_id: &PaneId, reduce_by: f64) -> Result<bool> {
         let err_context =
             || format!("failed to determine if pane {pane_id:?} can reduce width by {reduce_by} %");

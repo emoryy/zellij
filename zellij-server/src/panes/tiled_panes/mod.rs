@@ -2134,6 +2134,29 @@ impl TiledPanes {
         pane_grid.flexible_space_for_pane(&pane_id, direction)
     }
 
+    /// Move the boundaries the given edges of the given pane sit on, by a number of cells
+    /// each, returning how far they moved in total.
+    pub fn move_pane_boundaries(
+        &mut self,
+        pane_id: PaneId,
+        moves: &[(Direction, isize)],
+    ) -> Result<isize> {
+        let mut pane_grid = TiledPaneGrid::new(
+            &mut self.panes,
+            &self.panes_to_hide,
+            *self.display_area.borrow(),
+            *self.viewport.borrow(),
+        );
+        let moved = pane_grid.move_pane_boundaries(&pane_id, moves)?;
+        if moved != 0 {
+            for pane in self.panes.values_mut() {
+                resize_pty!(pane, self.os_api, self.senders, self.character_cell_size).non_fatal();
+            }
+            self.reset_boundaries();
+        }
+        Ok(moved)
+    }
+
     pub fn resize_pane_with_strategies(
         &mut self,
         pane_id: PaneId,

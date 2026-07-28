@@ -6,6 +6,7 @@ use zellij_utils::data::{
 };
 use zellij_utils::errors::prelude::*;
 use zellij_utils::input::actions::Action;
+use zellij_utils::input::layout::SplitDirection;
 use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::input::mousebinds::{
     mouse_button_of_event, mouse_modifiers_of_event, MouseBehaviour, MouseBinding,
@@ -337,6 +338,11 @@ struct MouseEventContext {
     press_owner: Option<MousePressOwner>,
 }
 
+/// A resize does not always move a border by exactly as many cells as were asked for,
+/// because percentages are rounded to whole cells and a border can be blocked by a minimum
+/// pane size. A handful of attempts per mouse event is enough to close that gap.
+const MAX_RESIZE_CORRECTIONS_PER_EVENT: usize = 4;
+
 fn edge_and_delta_to_strategies(
     edge: PaneEdge,
     delta_x: isize,
@@ -345,104 +351,45 @@ fn edge_and_delta_to_strategies(
     use Direction::*;
     use Resize::*;
 
-    match edge {
-        PaneEdge::Left => {
-            let resize = if delta_x < 0 { Increase } else { Decrease };
-            vec![ResizeStrategy {
-                resize,
-                direction: Some(Left),
-                invert_on_boundaries: false,
-            }]
-        },
-        PaneEdge::Right => {
-            let resize = if delta_x > 0 { Increase } else { Decrease };
-            vec![ResizeStrategy {
-                resize,
-                direction: Some(Right),
-                invert_on_boundaries: false,
-            }]
-        },
-        PaneEdge::Top => {
-            let resize = if delta_y < 0 { Increase } else { Decrease };
-            vec![ResizeStrategy {
-                resize,
-                direction: Some(Up),
-                invert_on_boundaries: false,
-            }]
-        },
-        PaneEdge::Bottom => {
-            let resize = if delta_y > 0 { Increase } else { Decrease };
-            vec![ResizeStrategy {
-                resize,
-                direction: Some(Down),
-                invert_on_boundaries: false,
-            }]
-        },
-        PaneEdge::TopLeft => {
-            let mut strategies = vec![];
-            let resize_y = if delta_y < 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_y,
-                direction: Some(Up),
-                invert_on_boundaries: false,
-            });
-            let resize_x = if delta_x < 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_x,
-                direction: Some(Left),
-                invert_on_boundaries: false,
-            });
-            strategies
-        },
-        PaneEdge::TopRight => {
-            let mut strategies = vec![];
-            let resize_y = if delta_y < 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_y,
-                direction: Some(Up),
-                invert_on_boundaries: false,
-            });
-            let resize_x = if delta_x > 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_x,
-                direction: Some(Right),
-                invert_on_boundaries: false,
-            });
-            strategies
-        },
-        PaneEdge::BottomLeft => {
-            let mut strategies = vec![];
-            let resize_y = if delta_y > 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_y,
-                direction: Some(Down),
-                invert_on_boundaries: false,
-            });
-            let resize_x = if delta_x < 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_x,
-                direction: Some(Left),
-                invert_on_boundaries: false,
-            });
-            strategies
-        },
-        PaneEdge::BottomRight => {
-            let mut strategies = vec![];
-            let resize_y = if delta_y > 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_y,
-                direction: Some(Down),
-                invert_on_boundaries: false,
-            });
-            let resize_x = if delta_x > 0 { Increase } else { Decrease };
-            strategies.push(ResizeStrategy {
-                resize: resize_x,
-                direction: Some(Right),
-                invert_on_boundaries: false,
-            });
-            strategies
-        },
+    let horizontal = match edge {
+        PaneEdge::Left | PaneEdge::TopLeft | PaneEdge::BottomLeft => Some(Left),
+        PaneEdge::Right | PaneEdge::TopRight | PaneEdge::BottomRight => Some(Right),
+        PaneEdge::Top | PaneEdge::Bottom => None,
+    };
+    let vertical = match edge {
+        PaneEdge::Top | PaneEdge::TopLeft | PaneEdge::TopRight => Some(Up),
+        PaneEdge::Bottom | PaneEdge::BottomLeft | PaneEdge::BottomRight => Some(Down),
+        PaneEdge::Left | PaneEdge::Right => None,
+    };
+
+    // An axis the cursor did not move along is left out entirely, a zero-sized resize would
+    // only make the layout solver run for nothing
+    let mut strategies = vec![];
+    if let Some(direction) = vertical.filter(|_| delta_y != 0) {
+        let grows = if direction == Up {
+            delta_y < 0
+        } else {
+            delta_y > 0
+        };
+        strategies.push(ResizeStrategy {
+            resize: if grows { Increase } else { Decrease },
+            direction: Some(direction),
+            invert_on_boundaries: false,
+        });
     }
+    if let Some(direction) = horizontal.filter(|_| delta_x != 0) {
+        let grows = if direction == Left {
+            delta_x < 0
+        } else {
+            delta_x > 0
+        };
+        strategies.push(ResizeStrategy {
+            resize: if grows { Increase } else { Decrease },
+            direction: Some(direction),
+            invert_on_boundaries: false,
+        });
+    }
+    strategies
 }
 
 fn next_click_count(
@@ -801,6 +748,48 @@ impl MouseHandler {
         Ok(())
     }
 
+    /// The coordinates of the boundaries the given edge sits on, `None` for an axis the edge
+    /// does not own.
+    fn edge_boundaries(geom: &PaneGeom, edge: PaneEdge) -> (Option<isize>, Option<isize>) {
+        let boundary_x = match edge {
+            PaneEdge::Left | PaneEdge::TopLeft | PaneEdge::BottomLeft => Some(geom.x as isize),
+            PaneEdge::Right | PaneEdge::TopRight | PaneEdge::BottomRight => {
+                Some((geom.x + geom.cols.as_usize()) as isize)
+            },
+            PaneEdge::Top | PaneEdge::Bottom => None,
+        };
+        let boundary_y = match edge {
+            PaneEdge::Top | PaneEdge::TopLeft | PaneEdge::TopRight => Some(geom.y as isize),
+            PaneEdge::Bottom | PaneEdge::BottomLeft | PaneEdge::BottomRight => {
+                Some((geom.y + geom.rows.as_usize()) as isize)
+            },
+            PaneEdge::Left | PaneEdge::Right => None,
+        };
+        (boundary_x, boundary_y)
+    }
+
+    /// How many cells the dragged edge still has to travel to sit under the cursor, keeping
+    /// the offset it had when it was grabbed.
+    fn distance_from_edge_to_cursor(
+        tab: &Tab,
+        pane_id: PaneId,
+        edge: PaneEdge,
+        cursor: Position,
+        grab_offset: (Option<isize>, Option<isize>),
+    ) -> Option<(isize, isize)> {
+        let geom = tab.get_pane_with_id(pane_id)?.position_and_size();
+        let (boundary_x, boundary_y) = Self::edge_boundaries(&geom, edge);
+        let delta_x = match (boundary_x, grab_offset.0) {
+            (Some(boundary), Some(offset)) => cursor.column() as isize + offset - boundary,
+            _ => 0,
+        };
+        let delta_y = match (boundary_y, grab_offset.1) {
+            (Some(boundary), Some(offset)) => cursor.line() + offset - boundary,
+            _ => 0,
+        };
+        Some((delta_x, delta_y))
+    }
+
     fn continue_pane_resize_with_mouse(
         tab: &mut Tab,
         current_position: Position,
@@ -824,56 +813,78 @@ impl MouseHandler {
             }
         }
 
-        let (pane_id, edge, is_floating, delta_x, delta_y) =
-            if let Some(resize_state) = &tab.pane_being_resized_with_mouse {
-                let delta_x = current_position.column() as isize
-                    - resize_state.start_position.column() as isize;
-                let delta_y = current_position.line() - resize_state.start_position.line();
-
-                if delta_x == 0 && delta_y == 0 {
-                    return Ok(false);
-                }
-
+        // The edge is aimed at the cursor rather than moved by the distance the cursor
+        // travelled since the last event, so that a resize which was rounded, clamped or
+        // dropped does not leave the edge permanently trailing behind the cursor
+        let Some((pane_id, edge, is_floating, grab_offset)) = tab
+            .pane_being_resized_with_mouse
+            .as_ref()
+            .map(|resize_state| {
+                let (boundary_x, boundary_y) =
+                    Self::edge_boundaries(&resize_state.start_geom, resize_state.edge);
+                let grab_offset = (
+                    boundary_x.map(|b| b - resize_state.start_position.column() as isize),
+                    boundary_y.map(|b| b - resize_state.start_position.line()),
+                );
                 (
                     resize_state.pane_id,
                     resize_state.edge,
                     resize_state.is_floating,
-                    delta_x,
-                    delta_y,
+                    grab_offset,
+                )
+            })
+        else {
+            return Ok(true);
+        };
+
+        let mut resized = false;
+        let mut previous_distance = usize::MAX;
+        for _ in 0..MAX_RESIZE_CORRECTIONS_PER_EVENT {
+            let Some((delta_x, delta_y)) = Self::distance_from_edge_to_cursor(
+                tab,
+                pane_id,
+                edge,
+                current_position,
+                grab_offset,
+            ) else {
+                break;
+            };
+            let distance = delta_x.unsigned_abs() + delta_y.unsigned_abs();
+            if distance == 0 || distance >= previous_distance {
+                // the edge either arrived, or the previous attempt did not bring it any
+                // closer and another one would only make it oscillate
+                break;
+            }
+            previous_distance = distance;
+
+            let strategies = edge_and_delta_to_strategies(edge, delta_x, delta_y);
+            let resize_result = if is_floating {
+                Self::resize_floating_pane_with_strategies(
+                    tab,
+                    pane_id,
+                    &strategies,
+                    (delta_x.unsigned_abs(), delta_y.unsigned_abs()),
                 )
             } else {
-                return Ok(true);
+                Self::resize_tiled_pane_with_strategies(
+                    tab,
+                    pane_id,
+                    &strategies,
+                    (delta_x.abs() as f64, delta_y.abs() as f64),
+                )
             };
-
-        let strategies = edge_and_delta_to_strategies(edge, delta_x, delta_y);
-
-        let resize_result = if is_floating {
-            Self::resize_floating_pane_with_strategies(
-                tab,
-                pane_id,
-                &strategies,
-                (delta_x.unsigned_abs(), delta_y.unsigned_abs()),
-            )
-        } else {
-            Self::resize_tiled_pane_with_strategies(
-                tab,
-                pane_id,
-                &strategies,
-                (delta_x.abs() as f64, delta_y.abs() as f64),
-            )
-        };
-        if resize_result.is_err() {
-            tab.pane_being_resized_with_mouse = None;
-        }
-        resize_result.with_context(err_context)?;
-
-        if let Some(resize_state) = tab.pane_being_resized_with_mouse.as_mut() {
-            resize_state.start_position = current_position;
+            if resize_result.is_err() {
+                tab.pane_being_resized_with_mouse = None;
+            }
+            resize_result.with_context(err_context)?;
+            resized = true;
         }
 
-        tab.set_force_render();
+        if resized {
+            tab.set_force_render();
+        }
 
-        Ok(true)
+        Ok(resized)
     }
 
     fn stop_pane_resize_with_mouse(
@@ -933,18 +944,27 @@ impl MouseHandler {
     ) -> Result<()> {
         let err_context = || format!("failed to resize tiled pane {pane_id:?}");
 
+        // Percentages are measured against the space left over for flexible panes in the
+        // strip of the layout being resized, not against the whole viewport: a fixed-size
+        // pane sharing that strip would otherwise make the border move less than the cursor
+        let flexible_cols = tab
+            .tiled_panes
+            .flexible_space_for_pane(pane_id, SplitDirection::Horizontal);
+        let flexible_rows = tab
+            .tiled_panes
+            .flexible_space_for_pane(pane_id, SplitDirection::Vertical);
         let viewport = tab.viewport.borrow();
-        let viewport_cols = viewport.cols;
-        let viewport_rows = viewport.rows;
+        let space_cols = flexible_cols.unwrap_or(viewport.cols);
+        let space_rows = flexible_rows.unwrap_or(viewport.rows);
 
         let change_by_percent = (
-            if viewport_cols > 0 {
-                (change_by.0 / viewport_cols as f64) * 100.0
+            if space_cols > 0 {
+                (change_by.0 / space_cols as f64) * 100.0
             } else {
                 0.0
             },
-            if viewport_rows > 0 {
-                (change_by.1 / viewport_rows as f64) * 100.0
+            if space_rows > 0 {
+                (change_by.1 / space_rows as f64) * 100.0
             } else {
                 0.0
             },

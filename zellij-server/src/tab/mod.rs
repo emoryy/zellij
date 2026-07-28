@@ -645,56 +645,35 @@ pub trait Pane {
         position_on_screen.relative_to(self.get_content_y(), self.get_content_x())
     }
     fn position_is_on_frame(&self, position: &Position) -> bool {
-        if !self.contains(position) {
-            return false;
-        }
-        if (self.x()..self.get_content_x()).contains(&position.column()) {
-            // position is on left border
-            return true;
-        }
-        if (self.get_content_x() + self.get_content_columns()..(self.x() + self.cols()))
-            .contains(&position.column())
-        {
-            // position is on right border
-            return true;
-        }
-        if (self.y() as isize..self.get_content_y() as isize).contains(&position.line()) {
-            // position is on top border
-            return true;
-        }
-        if ((self.get_content_y() + self.get_content_rows()) as isize
-            ..(self.y() + self.rows()) as isize)
-            .contains(&position.line())
-        {
-            // position is on bottom border
-            return true;
-        }
-        false
+        self.get_edge_at_position(position).is_some()
     }
     fn get_edge_at_position(&self, position: &Position) -> Option<PaneEdge> {
         if !self.contains(position) {
             return None;
         }
 
-        let pos_col = position.column();
-        let pos_line = position.line();
-        let pane_x = self.x();
-        let pane_y = self.y();
-        let pane_cols = self.cols();
-        let pane_rows = self.rows();
+        // A corner is only reported where two borders actually overlap, so that dragging a
+        // border never resizes the perpendicular axis as well
+        let on_left = (self.x()..self.get_content_x()).contains(&position.column());
+        let on_right = (self.get_content_x() + self.get_content_columns()
+            ..(self.x() + self.cols()))
+            .contains(&position.column());
+        let on_top = (self.y() as isize..self.get_content_y() as isize).contains(&position.line());
+        let on_bottom = ((self.get_content_y() + self.get_content_rows()) as isize
+            ..(self.y() + self.rows()) as isize)
+            .contains(&position.line());
 
-        let mid_col = pane_x + pane_cols / 2;
-        let mid_line = pane_y + pane_rows / 2;
-
-        let is_left = pos_col < mid_col;
-        let is_top = (pos_line as usize) < mid_line;
-
-        return Some(match (is_top, is_left) {
-            (true, true) => PaneEdge::TopLeft,
-            (true, false) => PaneEdge::TopRight,
-            (false, true) => PaneEdge::BottomLeft,
-            (false, false) => PaneEdge::BottomRight,
-        });
+        match (on_top, on_bottom, on_left, on_right) {
+            (true, _, true, _) => Some(PaneEdge::TopLeft),
+            (true, _, _, true) => Some(PaneEdge::TopRight),
+            (_, true, true, _) => Some(PaneEdge::BottomLeft),
+            (_, true, _, true) => Some(PaneEdge::BottomRight),
+            (true, ..) => Some(PaneEdge::Top),
+            (_, true, ..) => Some(PaneEdge::Bottom),
+            (_, _, true, _) => Some(PaneEdge::Left),
+            (_, _, _, true) => Some(PaneEdge::Right),
+            _ => None,
+        }
     }
     // TODO: get rid of this in favor of intercept_mouse_event_on_frame
     fn intercept_left_mouse_click(&mut self, _position: &Position, _client_id: ClientId) -> bool {

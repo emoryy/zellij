@@ -19,6 +19,7 @@ use zellij_utils::data::{Direction, Event, NewPanePlacement, Resize, ResizeStrat
 use zellij_utils::errors::prelude::*;
 use zellij_utils::errors::ErrorContext;
 use zellij_utils::input::layout::{SplitDirection, SplitSize, TiledPaneLayout};
+use zellij_utils::input::mouse::{MouseEvent, MouseEventType};
 use zellij_utils::input::options::PaneFrameStyle;
 use zellij_utils::ipc::IpcReceiverWithContext;
 use zellij_utils::pane_size::{PaneGeom, Size, SizeInPixels};
@@ -21418,4 +21419,196 @@ fn ctrl_wheel_resizes_and_alt_wheel_jumps_prompts_regardless_of_the_line_count()
     alt.wheel_lines = 9;
     tab.handle_mouse_event(&alt, 1).unwrap();
     assert_ne!(scrolled_lines(&tab), 9);
+}
+
+#[test]
+pub fn get_edge_at_position_reports_the_border_under_the_cursor() {
+    use crate::tab::PaneEdge;
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    root.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let tab = create_new_tab_with_layout(size, root);
+
+    let pane = tab.tiled_panes.panes.get(&PaneId::Terminal(1)).unwrap();
+    let geom = pane.position_and_size();
+    let (x, y) = (geom.x, geom.y as isize);
+    let (cols, rows) = (geom.cols.as_usize(), geom.rows.as_usize());
+    let (right, bottom) = (x + cols - 1, y + rows as isize - 1);
+    let (mid_col, mid_line) = (x + cols / 2, y + rows as isize / 2);
+
+    let at = |col: usize, line: isize| {
+        pane.get_edge_at_position(&Position::new(line as i32, col as u16))
+    };
+
+    // a point in the middle of a border is that border, not a corner
+    assert_eq!(at(x, mid_line), Some(PaneEdge::Left));
+    assert_eq!(at(right, mid_line), Some(PaneEdge::Right));
+    assert_eq!(at(mid_col, y), Some(PaneEdge::Top));
+    assert_eq!(at(mid_col, bottom), Some(PaneEdge::Bottom));
+
+    // ...including one cell away from a corner
+    assert_eq!(at(x, y + 1), Some(PaneEdge::Left));
+    assert_eq!(at(x + 1, y), Some(PaneEdge::Top));
+    assert_eq!(at(right, bottom - 1), Some(PaneEdge::Right));
+    assert_eq!(at(right - 1, bottom), Some(PaneEdge::Bottom));
+
+    // corners are only the cells where two borders overlap
+    assert_eq!(at(x, y), Some(PaneEdge::TopLeft));
+    assert_eq!(at(right, y), Some(PaneEdge::TopRight));
+    assert_eq!(at(x, bottom), Some(PaneEdge::BottomLeft));
+    assert_eq!(at(right, bottom), Some(PaneEdge::BottomRight));
+
+    // the content area is not an edge at all
+    assert_eq!(at(mid_col, mid_line), None);
+
+    // outside the pane
+    assert_eq!(at(x + cols, mid_line), None);
+}
+
+fn drag_border_and_return_boundary(
+    tab: &mut Tab,
+    grab: (usize, isize),
+    steps: &[(usize, isize)],
+    boundary_of: u32,
+) -> Vec<usize> {
+    let mouse = |event_type, (col, line): (usize, isize)| MouseEvent {
+        event_type,
+        left: true,
+        right: false,
+        middle: false,
+        wheel_up: false,
+        wheel_down: false,
+        wheel_left: false,
+        wheel_right: false,
+        wheel_lines: 0,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        position: Position::new(line as i32, col as u16),
+    };
+    tab.handle_mouse_event(&mouse(MouseEventType::Press, grab), 1)
+        .unwrap();
+    let mut boundaries = vec![];
+    for step in steps {
+        tab.handle_mouse_event(&mouse(MouseEventType::Motion, *step), 1)
+            .unwrap();
+        let geom = tab
+            .tiled_panes
+            .panes
+            .get(&PaneId::Terminal(boundary_of))
+            .unwrap()
+            .position_and_size();
+        boundaries.push(geom.x + geom.cols.as_usize());
+    }
+    tab.handle_mouse_event(&mouse(MouseEventType::Release, *steps.last().unwrap()), 1)
+        .unwrap();
+    boundaries
+}
+
+#[test]
+pub fn dragged_border_follows_the_cursor() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    root.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut tab = create_new_tab_with_layout(size, root);
+
+    // grab the right border of the left pane (its last column) and drag it left
+    let steps: Vec<(usize, isize)> = (1..=8).map(|step| (60 - step, 10)).collect();
+    let boundaries = drag_border_and_return_boundary(&mut tab, (60, 10), &steps, 0);
+
+    // the grabbed column is one to the left of the boundary, so the boundary is expected to
+    // stay one to the right of the cursor for the whole drag
+    let expected: Vec<usize> = steps.iter().map(|(col, _)| col + 1).collect();
+    assert_eq!(boundaries, expected);
+}
+
+#[test]
+pub fn dragged_border_follows_the_cursor_next_to_a_fixed_size_pane() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    let mut fixed = TiledPaneLayout::default();
+    fixed.split_size = Some(SplitSize::Fixed(61));
+    root.children = vec![
+        fixed,
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+    ];
+    let mut tab = create_new_tab_with_layout(size, root);
+
+    // pane 1 spans 61..91, so its last column is 90
+    let steps: Vec<(usize, isize)> = (1..=8).map(|step| (90 - step, 10)).collect();
+    let boundaries = drag_border_and_return_boundary(&mut tab, (90, 10), &steps, 1);
+
+    let expected: Vec<usize> = steps.iter().map(|(col, _)| col + 1).collect();
+    assert_eq!(boundaries, expected);
+}
+
+#[test]
+pub fn dragged_border_catches_up_with_the_cursor_after_being_blocked() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    root.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut tab = create_new_tab_with_layout(size, root);
+
+    let mouse = |event_type, col: usize| MouseEvent {
+        event_type,
+        left: true,
+        right: false,
+        middle: false,
+        wheel_up: false,
+        wheel_down: false,
+        wheel_left: false,
+        wheel_right: false,
+        wheel_lines: 0,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        position: Position::new(10, col as u16),
+    };
+    let boundary = |tab: &Tab| {
+        let geom = tab
+            .tiled_panes
+            .panes
+            .get(&PaneId::Terminal(0))
+            .unwrap()
+            .position_and_size();
+        geom.x + geom.cols.as_usize()
+    };
+
+    // grab the right border of the left pane and squash it against its minimum width
+    tab.handle_mouse_event(&mouse(MouseEventType::Press, 60), 1)
+        .unwrap();
+    for col in (3..60).rev() {
+        tab.handle_mouse_event(&mouse(MouseEventType::Motion, col), 1)
+            .unwrap();
+    }
+    let blocked_at = boundary(&tab);
+    assert!(
+        blocked_at > 4,
+        "the border should have been blocked by the minimum pane width, was at {blocked_at}"
+    );
+
+    // dragging back must put the border under the cursor again rather than resuming from
+    // where it was blocked
+    for col in 4..=30 {
+        tab.handle_mouse_event(&mouse(MouseEventType::Motion, col), 1)
+            .unwrap();
+    }
+    assert_eq!(boundary(&tab), 31);
 }

@@ -519,6 +519,50 @@ impl<'a> TiledPaneGrid<'a> {
         Ok(true)
     }
 
+    /// The space percentages are measured against along `direction` in the strip of the
+    /// layout containing `pane_id`, ie. the display area minus the fixed-size panes sharing
+    /// that strip. This is what the constraint solver divides percentages by, so a caller
+    /// that wants to change a pane by n cells needs a percentage of this rather than of the
+    /// whole viewport.
+    pub fn flexible_space_for_pane(
+        &self,
+        pane_id: &PaneId,
+        direction: SplitDirection,
+    ) -> Option<usize> {
+        let pane_to_check = self.get_pane_geom(pane_id)?;
+        let panes = self.panes.borrow();
+        let mut seen = HashSet::new();
+        let mut fixed_space = 0;
+        for p_id in panes.keys() {
+            let Some(pane) = self.get_pane_geom(p_id) else {
+                continue;
+            };
+            if !seen.insert(pane) {
+                continue;
+            }
+            let (shares_strip, size) = match direction {
+                SplitDirection::Horizontal => (
+                    pane.y < pane_to_check.y + pane_to_check.rows.as_usize()
+                        && pane_to_check.y < pane.y + pane.rows.as_usize(),
+                    pane.cols,
+                ),
+                SplitDirection::Vertical => (
+                    pane.x < pane_to_check.x + pane_to_check.cols.as_usize()
+                        && pane_to_check.x < pane.x + pane.cols.as_usize(),
+                    pane.rows,
+                ),
+            };
+            if shares_strip && size.is_fixed() {
+                fixed_space += size.as_usize();
+            }
+        }
+        let space = match direction {
+            SplitDirection::Horizontal => self.display_area.cols,
+            SplitDirection::Vertical => self.display_area.rows,
+        };
+        Some(space.saturating_sub(fixed_space))
+    }
+
     fn can_reduce_pane_width(&self, pane_id: &PaneId, reduce_by: f64) -> Result<bool> {
         let err_context =
             || format!("failed to determine if pane {pane_id:?} can reduce width by {reduce_by} %");

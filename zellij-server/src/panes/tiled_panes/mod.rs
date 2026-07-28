@@ -2120,6 +2120,20 @@ impl TiledPanes {
         Ok(pane_size_changed)
     }
 
+    pub fn flexible_space_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        direction: SplitDirection,
+    ) -> Option<usize> {
+        let pane_grid = TiledPaneGrid::new(
+            &mut self.panes,
+            &self.panes_to_hide,
+            *self.display_area.borrow(),
+            *self.viewport.borrow(),
+        );
+        pane_grid.flexible_space_for_pane(&pane_id, direction)
+    }
+
     pub fn resize_pane_with_strategies(
         &mut self,
         pane_id: PaneId,

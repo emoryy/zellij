@@ -18205,6 +18205,821 @@ fn floating_plugin_panes_are_not_shown_again_when_their_tab_returns_with_the_sur
     );
 }
 
+// ---------------------------------------------------------------------------
+// TEMPORARY DIAGNOSTICS (mouse separator drag investigation)
+// ---------------------------------------------------------------------------
+
+fn diag_geoms(tab: &Tab) -> Vec<(u32, usize, usize, usize, usize, String, String)> {
+    let mut out = vec![];
+    for (pid, pane) in tab.tiled_panes.panes.iter() {
+        let g = pane.position_and_size();
+        let id = match pid {
+            PaneId::Terminal(id) => *id,
+            PaneId::Plugin(id) => *id,
+        };
+        out.push((
+            id,
+            g.x,
+            g.y,
+            g.cols.as_usize(),
+            g.rows.as_usize(),
+            format!("{:?}", g.cols.constraint),
+            format!("{:?}", g.rows.constraint),
+        ));
+    }
+    out
+}
+
+fn diag_print(label: &str, tab: &Tab) {
+    println!("--- {} ---", label);
+    for (id, x, y, cols, rows, cc, rc) in diag_geoms(tab) {
+        println!(
+            "  pane {}: x={:<3} y={:<3} cols={:<3} rows={:<3} colc={:<24} rowc={}",
+            id, x, y, cols, rows, cc, rc
+        );
+    }
+}
+
+fn diag_nested_tab() -> Tab {
+    // left column (single pane) | right column (three stacked panes)
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    let mut right = TiledPaneLayout::default();
+    right.children_split_direction = SplitDirection::Horizontal;
+    right.children = vec![
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+    ];
+    root.children = vec![TiledPaneLayout::default(), right];
+    create_new_tab_with_layout(size, root)
+}
+
+fn diag_mouse(event_type: MouseEventType, col: usize, line: isize) -> MouseEvent {
+    MouseEvent {
+        event_type,
+        left: true,
+        right: false,
+        middle: false,
+        wheel_up: false,
+        wheel_down: false,
+        wheel_left: false,
+        wheel_right: false,
+        wheel_lines: 0,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        position: Position::new(line as i32, col as u16),
+    }
+}
+
+fn diag_grab_point(tab: &Tab, pane_id: u32) -> (usize, isize) {
+    let pane = tab
+        .tiled_panes
+        .panes
+        .get(&PaneId::Terminal(pane_id))
+        .unwrap();
+    let g = pane.position_and_size();
+    (g.x, (g.y + g.rows.as_usize() / 2) as isize)
+}
+
+/// Drag the vertical separator between the left column and the right column
+/// strictly horizontally, and watch what happens to the horizontal separators
+/// inside the right column.
+#[test]
+pub fn diag_drag_vertical_separator_horizontally() {
+    let mut tab = diag_nested_tab();
+    diag_print("initial", &tab);
+
+    let (grab_col, grab_line) = diag_grab_point(&tab, 2);
+    println!("grabbing at col={} line={}", grab_col, grab_line);
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+
+    for step in 1..=6 {
+        let col = grab_col - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, grab_line), 1)
+            .unwrap();
+        diag_print(&format!("after motion to col={}", col), &tab);
+    }
+    tab.handle_mouse_event(
+        &diag_mouse(MouseEventType::Release, grab_col - 6, grab_line),
+        1,
+    )
+    .unwrap();
+}
+
+/// Same drag, but with one row of vertical mouse jitter mixed in, which is what
+/// a real mouse produces.
+#[test]
+pub fn diag_drag_vertical_separator_with_jitter() {
+    let mut tab = diag_nested_tab();
+    diag_print("initial", &tab);
+    let (grab_col, grab_line) = diag_grab_point(&tab, 2);
+    println!("grabbing at col={} line={}", grab_col, grab_line);
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=6 {
+        let col = grab_col - step;
+        let line = if step % 2 == 0 {
+            grab_line + 1
+        } else {
+            grab_line
+        };
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, line), 1)
+            .unwrap();
+        diag_print(&format!("after motion to col={} line={}", col, line), &tab);
+    }
+}
+
+/// Same drag repeated on freshly built (identical) tabs inside one process. If
+/// the resize pipeline were order-independent, every run would end in the same
+/// geometry.
+#[test]
+pub fn diag_drag_is_deterministic() {
+    let mut results = vec![];
+    for run in 0..12 {
+        let mut tab = diag_nested_tab();
+        let (grab_col, grab_line) = diag_grab_point(&tab, 2);
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+            .unwrap();
+        for step in 1..=6 {
+            tab.handle_mouse_event(
+                &diag_mouse(MouseEventType::Motion, grab_col - step, grab_line),
+                1,
+            )
+            .unwrap();
+        }
+        let geoms = diag_geoms(&tab);
+        println!("run {}: {:?}", run, geoms);
+        results.push(geoms);
+    }
+    let first = &results[0];
+    let differing: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| *r != first)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "identical drags produced different layouts in runs {:?}",
+        differing
+    );
+}
+
+fn diag_grid_tab(size: Size, cols: usize, rows: usize) -> Tab {
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    root.children = (0..cols)
+        .map(|_| {
+            let mut column = TiledPaneLayout::default();
+            column.children_split_direction = SplitDirection::Horizontal;
+            column.children = (0..rows).map(|_| TiledPaneLayout::default()).collect();
+            column
+        })
+        .collect();
+    create_new_tab_with_layout(size, root)
+}
+
+fn diag_boundaries(tab: &Tab) -> (Vec<usize>, Vec<usize>) {
+    let mut xs: Vec<usize> = vec![];
+    let mut ys: Vec<usize> = vec![];
+    for (_pid, pane) in tab.tiled_panes.panes.iter() {
+        let g = pane.position_and_size();
+        xs.push(g.x);
+        ys.push(g.y);
+    }
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    (xs, ys)
+}
+
+/// 3x3 grid: drag the *first* vertical separator and watch every other
+/// separator in the layout.
+#[test]
+pub fn diag_grid_drag_first_vertical_separator() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 3, 3);
+    diag_print("initial", &tab);
+    println!("boundaries: {:?}", diag_boundaries(&tab));
+
+    // pane ids run column-major: 0,1,2 = first column, 3,4,5 = second column
+    let (grab_col, grab_line) = diag_grab_point(&tab, 5);
+    println!("grabbing at col={} line={}", grab_col, grab_line);
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=8 {
+        let col = grab_col - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, grab_line), 1)
+            .unwrap();
+        let (xs, ys) = diag_boundaries(&tab);
+        println!(
+            "motion col={} -> x boundaries {:?} y boundaries {:?}",
+            col, xs, ys
+        );
+    }
+    diag_print("final", &tab);
+}
+
+/// Same drag repeated on identical 3x3 grids inside one process.
+#[test]
+pub fn diag_grid_drag_is_deterministic() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut results = vec![];
+    for run in 0..16 {
+        let mut tab = diag_grid_tab(size, 3, 3);
+        let (grab_col, grab_line) = diag_grab_point(&tab, 5);
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+            .unwrap();
+        for step in 1..=8 {
+            tab.handle_mouse_event(
+                &diag_mouse(MouseEventType::Motion, grab_col - step, grab_line),
+                1,
+            )
+            .unwrap();
+        }
+        let b = diag_boundaries(&tab);
+        println!("run {}: {:?}", run, b);
+        results.push(b);
+    }
+    let first = &results[0];
+    let differing: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| *r != first)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "identical drags produced different boundaries in runs {:?}",
+        differing
+    );
+}
+
+/// Sweep terminal sizes: drag a vertical separator strictly horizontally, with
+/// one row of vertical jitter, and report whether any *horizontal* separator
+/// moved as a result.
+#[test]
+pub fn diag_jitter_moves_horizontal_separators() {
+    let mut affected = vec![];
+    for rows in 16..=40 {
+        for cols in [80usize, 121, 200] {
+            let size = Size { cols, rows };
+            let mut tab = diag_grid_tab(size, 2, 3);
+            let (_, ys_before) = diag_boundaries(&tab);
+            let (grab_col, grab_line) = diag_grab_point(&tab, 5);
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+                .unwrap();
+            for step in 1..=6 {
+                let line = if step % 2 == 0 {
+                    grab_line + 1
+                } else {
+                    grab_line
+                };
+                tab.handle_mouse_event(
+                    &diag_mouse(MouseEventType::Motion, grab_col - step, line),
+                    1,
+                )
+                .unwrap();
+            }
+            let (_, ys_after) = diag_boundaries(&tab);
+            if ys_before != ys_after {
+                affected.push((cols, rows, ys_before.clone(), ys_after.clone()));
+            }
+        }
+    }
+    println!("sizes where row boundaries moved during a horizontal drag:");
+    for (cols, rows, before, after) in &affected {
+        println!("  {}x{}: {:?} -> {:?}", cols, rows, before, after);
+    }
+    println!("total: {}", affected.len());
+}
+
+/// Same, but with no vertical jitter at all: does a purely horizontal drag ever
+/// disturb the horizontal separators?
+#[test]
+pub fn diag_pure_horizontal_drag_moves_horizontal_separators() {
+    let mut affected = vec![];
+    for rows in 16..=40 {
+        for cols in [80usize, 121, 200] {
+            let size = Size { cols, rows };
+            let mut tab = diag_grid_tab(size, 2, 3);
+            let (_, ys_before) = diag_boundaries(&tab);
+            let (grab_col, grab_line) = diag_grab_point(&tab, 5);
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+                .unwrap();
+            for step in 1..=6 {
+                tab.handle_mouse_event(
+                    &diag_mouse(MouseEventType::Motion, grab_col - step, grab_line),
+                    1,
+                )
+                .unwrap();
+            }
+            let (_, ys_after) = diag_boundaries(&tab);
+            if ys_before != ys_after {
+                affected.push((cols, rows, ys_before.clone(), ys_after.clone()));
+            }
+        }
+    }
+    println!("sizes where row boundaries moved during a jitter-free horizontal drag:");
+    for (cols, rows, before, after) in &affected {
+        println!("  {}x{}: {:?} -> {:?}", cols, rows, before, after);
+    }
+    println!("total: {}", affected.len());
+}
+
+/// A fast drag (many cells per event, as produced by moving the mouse quickly)
+/// versus the same distance covered one cell at a time.
+#[test]
+pub fn diag_fast_vs_slow_drag() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+
+    let mut slow = diag_grid_tab(size, 3, 3);
+    let (grab_col, grab_line) = diag_grab_point(&slow, 5);
+    slow.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=12 {
+        slow.handle_mouse_event(
+            &diag_mouse(MouseEventType::Motion, grab_col - step, grab_line),
+            1,
+        )
+        .unwrap();
+    }
+    diag_print("slow drag (12 x 1 cell)", &slow);
+    println!("slow boundaries: {:?}", diag_boundaries(&slow));
+
+    let mut fast = diag_grid_tab(size, 3, 3);
+    fast.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    fast.handle_mouse_event(
+        &diag_mouse(MouseEventType::Motion, grab_col - 12, grab_line),
+        1,
+    )
+    .unwrap();
+    diag_print("fast drag (1 x 12 cells)", &fast);
+    println!("fast boundaries: {:?}", diag_boundaries(&fast));
+}
+
+/// Find the pane that owns the left frame border at the given x boundary,
+/// preferring one whose vertical middle band contains `band_line`.
+fn diag_pane_at_x(tab: &Tab, x: usize, band_line: usize) -> u32 {
+    let mut candidates: Vec<(u32, usize, usize)> = vec![];
+    for (pid, pane) in tab.tiled_panes.panes.iter() {
+        let g = pane.position_and_size();
+        if g.x == x {
+            let id = match pid {
+                PaneId::Terminal(id) => *id,
+                PaneId::Plugin(id) => *id,
+            };
+            candidates.push((id, g.y, g.rows.as_usize()));
+        }
+    }
+    candidates
+        .iter()
+        .find(|(_, y, rows)| *y <= band_line && band_line < y + rows)
+        .map(|(id, _, _)| *id)
+        .unwrap_or(candidates[0].0)
+}
+
+/// Drag a vertical separator while the mouse also drifts downward, the way a
+/// hand-held mouse actually moves.
+#[test]
+pub fn diag_diagonal_drag() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 2, 3);
+    diag_print("initial", &tab);
+    let (xs, _) = diag_boundaries(&tab);
+    let separator_x = xs[1];
+    let target = diag_pane_at_x(&tab, separator_x, 15);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    println!(
+        "separator at x={}, grabbing pane {} at col={} line={}",
+        separator_x, target, grab_col, grab_line
+    );
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=6 {
+        let col = grab_col - step;
+        let line = grab_line + step as isize;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, line), 1)
+            .unwrap();
+        let (xs, ys) = diag_boundaries(&tab);
+        println!("motion col={} line={} -> x {:?} y {:?}", col, line, xs, ys);
+    }
+    diag_print("final", &tab);
+}
+
+/// Drag a vertical separator with a single row of up/down jitter, printing the
+/// full geometry so both the rendered rows and the stored percentages are
+/// visible.
+#[test]
+pub fn diag_jitter_drag_detail() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 2, 3);
+    let (xs, _) = diag_boundaries(&tab);
+    let separator_x = xs[1];
+    let target = diag_pane_at_x(&tab, separator_x, 15);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    println!(
+        "separator at x={}, grabbing pane {} at col={} line={}",
+        separator_x, target, grab_col, grab_line
+    );
+    diag_print("initial", &tab);
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=6 {
+        let col = grab_col - step;
+        let line = if step % 2 == 0 {
+            grab_line + 1
+        } else {
+            grab_line
+        };
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, line), 1)
+            .unwrap();
+        diag_print(&format!("motion col={} line={}", col, line), &tab);
+    }
+}
+
+/// After a drag that only ever moved horizontally, ask the layout to reflow (as
+/// a terminal window resize would) and see whether the row boundaries snap to
+/// percentages that drifted during the drag.
+#[test]
+pub fn diag_drift_then_reflow() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 2, 3);
+    let (xs, _) = diag_boundaries(&tab);
+    let separator_x = xs[1];
+    let target = diag_pane_at_x(&tab, separator_x, 15);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=5 {
+        // mouse drifts one row down and stays there
+        let line = grab_line + 1;
+        tab.handle_mouse_event(
+            &diag_mouse(MouseEventType::Motion, grab_col - step, line),
+            1,
+        )
+        .unwrap();
+    }
+    tab.handle_mouse_event(
+        &diag_mouse(MouseEventType::Release, grab_col - 5, grab_line + 1),
+        1,
+    )
+    .unwrap();
+    diag_print("after drag", &tab);
+    tab.resize_whole_tab(Size {
+        cols: 121,
+        rows: 31,
+    })
+    .unwrap();
+    diag_print("after growing the terminal by one row", &tab);
+    tab.resize_whole_tab(Size {
+        cols: 121,
+        rows: 30,
+    })
+    .unwrap();
+    diag_print("after shrinking it back", &tab);
+}
+
+/// Keep dragging one separator until the shrinking neighbour hits its minimum,
+/// then keep going, and watch every boundary in the layout.
+#[test]
+pub fn diag_drag_past_minimum() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 3, 3);
+    let (xs, _) = diag_boundaries(&tab);
+    let separator_x = xs[1];
+    let target = diag_pane_at_x(&tab, separator_x, 15);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    println!(
+        "separator at x={}, grabbing pane {} at col={} line={}",
+        separator_x, target, grab_col, grab_line
+    );
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=38 {
+        let col = grab_col - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, grab_line), 1)
+            .unwrap();
+        let (xs, ys) = diag_boundaries(&tab);
+        println!("motion col={:<3} -> x {:?} y {:?}", col, xs, ys);
+    }
+    diag_print("final", &tab);
+}
+
+/// A row that also contains a fixed-size pane: the mouse delta is converted to
+/// a percentage of the whole viewport, but the solver interprets percentages
+/// relative to the *flexible* space in the boundary group.
+#[test]
+pub fn diag_drag_row_with_fixed_pane() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    let mut fixed = TiledPaneLayout::default();
+    fixed.split_size = Some(SplitSize::Fixed(61));
+    root.children = vec![
+        fixed,
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+    ];
+    let mut tab = create_new_tab_with_layout(size, root);
+    diag_print("initial", &tab);
+    let (xs, _) = diag_boundaries(&tab);
+    println!("boundaries: {:?}", xs);
+    let separator_x = xs[2];
+    let target = diag_pane_at_x(&tab, separator_x, 10);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    println!(
+        "dragging separator at x={} (pane {}) from col={}",
+        separator_x, target, grab_col
+    );
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=8 {
+        let col = grab_col - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, grab_line), 1)
+            .unwrap();
+        let (xs, _) = diag_boundaries(&tab);
+        println!(
+            "cursor at col={:<3} -> boundaries {:?} (cursor moved {} cells, separator moved {} cells)",
+            col,
+            xs,
+            grab_col - col,
+            separator_x as isize - xs[2] as isize
+        );
+    }
+}
+
+/// Same as above but with the real default UI panes present (tab bar and status
+/// bar are fixed-size rows), dragging a horizontal separator.
+#[test]
+pub fn diag_drag_horizontal_separator_with_ui_rows() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Horizontal;
+    let mut tab_bar = TiledPaneLayout::default();
+    tab_bar.split_size = Some(SplitSize::Fixed(1));
+    let mut status_bar = TiledPaneLayout::default();
+    status_bar.split_size = Some(SplitSize::Fixed(2));
+    root.children = vec![
+        tab_bar,
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+        status_bar,
+    ];
+    let mut tab = create_new_tab_with_layout(size, root);
+    diag_print("initial", &tab);
+    let (_, ys) = diag_boundaries(&tab);
+    println!("row boundaries: {:?}", ys);
+    // grab the top border of the second content pane
+    let separator_y = ys[2];
+    let target = {
+        let mut found = 0;
+        for (pid, pane) in tab.tiled_panes.panes.iter() {
+            if pane.position_and_size().y == separator_y {
+                found = match pid {
+                    PaneId::Terminal(id) => *id,
+                    PaneId::Plugin(id) => *id,
+                };
+            }
+        }
+        found
+    };
+    let grab_col = 60;
+    println!(
+        "dragging horizontal separator at y={} (pane {})",
+        separator_y, target
+    );
+    tab.handle_mouse_event(
+        &diag_mouse(MouseEventType::Press, grab_col, separator_y as isize),
+        1,
+    )
+    .unwrap();
+    for step in 1..=8 {
+        let line = separator_y as isize - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, grab_col, line), 1)
+            .unwrap();
+        let (_, ys) = diag_boundaries(&tab);
+        println!(
+            "cursor at line={:<3} -> row boundaries {:?} (cursor moved {} rows, separator moved {} rows)",
+            line,
+            ys,
+            step,
+            separator_y as isize - ys[2] as isize
+        );
+    }
+    diag_print("final", &tab);
+}
+
+/// Unaligned layout: the left column has three rows, the right column has two,
+/// so the panes on the right span more than one horizontal boundary group.
+fn diag_staircase_tab(size: Size) -> Tab {
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Vertical;
+    let mut left = TiledPaneLayout::default();
+    left.children_split_direction = SplitDirection::Horizontal;
+    left.children = vec![
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+        TiledPaneLayout::default(),
+    ];
+    let mut right = TiledPaneLayout::default();
+    right.children_split_direction = SplitDirection::Horizontal;
+    right.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    root.children = vec![left, right];
+    create_new_tab_with_layout(size, root)
+}
+
+#[test]
+pub fn diag_staircase_drag() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_staircase_tab(size);
+    diag_print("initial", &tab);
+    let (xs, ys) = diag_boundaries(&tab);
+    println!("boundaries x {:?} y {:?}", xs, ys);
+    let separator_x = xs[1];
+    let target = diag_pane_at_x(&tab, separator_x, 20);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    println!(
+        "grabbing pane {} at col={} line={}",
+        target, grab_col, grab_line
+    );
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=8 {
+        let col = grab_col - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, grab_line), 1)
+            .unwrap();
+        diag_print(&format!("motion col={}", col), &tab);
+    }
+}
+
+#[test]
+pub fn diag_staircase_drag_is_deterministic() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut results = vec![];
+    for run in 0..16 {
+        let mut tab = diag_staircase_tab(size);
+        let (xs, _) = diag_boundaries(&tab);
+        let target = diag_pane_at_x(&tab, xs[1], 20);
+        let (grab_col, grab_line) = diag_grab_point(&tab, target);
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+            .unwrap();
+        for step in 1..=8 {
+            tab.handle_mouse_event(
+                &diag_mouse(MouseEventType::Motion, grab_col - step, grab_line),
+                1,
+            )
+            .unwrap();
+        }
+        let geoms = diag_geoms(&tab);
+        println!("run {}: {:?}", run, geoms);
+        results.push(geoms);
+    }
+    let first = &results[0];
+    let differing: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| *r != first)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        differing.is_empty(),
+        "identical drags produced different layouts in runs {:?}",
+        differing
+    );
+}
+
+/// Stacked panes in one column, dragging the vertical separator next to them.
+#[test]
+pub fn diag_stack_drag() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 2, 1);
+    // turn the right pane into a stack of three
+    for new_id in 2..=3 {
+        tab.new_pane(
+            PaneId::Terminal(new_id + 10),
+            None,
+            None,
+            false,
+            true,
+            NewPanePlacement::Stacked {
+                pane_id_to_stack_under: None,
+                borderless: Some(false),
+                border_style: None,
+            },
+            Some(1),
+            None,
+        )
+        .unwrap();
+    }
+    diag_print("initial", &tab);
+    let (xs, _) = diag_boundaries(&tab);
+    println!("boundaries {:?}", xs);
+    let separator_x = xs[1];
+    let target = diag_pane_at_x(&tab, separator_x, 15);
+    let (grab_col, grab_line) = diag_grab_point(&tab, target);
+    println!(
+        "grabbing pane {} at col={} line={}",
+        target, grab_col, grab_line
+    );
+    tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+        .unwrap();
+    for step in 1..=6 {
+        let col = grab_col - step;
+        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, grab_line), 1)
+            .unwrap();
+        diag_print(&format!("motion col={}", col), &tab);
+    }
+}
+
+/// The visual separator between two side-by-side panes is TWO columns wide (the
+/// left pane's right frame column and the right pane's left frame column).
+/// Grab each of them in turn, with the same downward mouse drift, and see which
+/// horizontal separator moves as a side effect.
+#[test]
+pub fn diag_which_column_of_the_separator_was_grabbed() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    for grab_col in [60usize, 61] {
+        let mut tab = diag_grid_tab(size, 2, 3);
+        let (xs, ys) = diag_boundaries(&tab);
+        println!(
+            "\n=== grabbing column {} of the separator (x boundaries {:?}, y boundaries {:?}) ===",
+            grab_col, xs, ys
+        );
+        for grab_line in [12isize, 18] {
+            let mut tab = diag_grid_tab(size, 2, 3);
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+                .unwrap();
+            for step in 1..=6 {
+                tab.handle_mouse_event(
+                    &diag_mouse(
+                        MouseEventType::Motion,
+                        grab_col - step,
+                        grab_line + step as isize,
+                    ),
+                    1,
+                )
+                .unwrap();
+            }
+            let (xs, ys) = diag_boundaries(&tab);
+            println!(
+                "  grabbed at line {} -> x boundaries {:?}, y boundaries {:?}",
+                grab_line, xs, ys
+            );
+            diag_print("     geometry", &tab);
+        }
+        let _ = tab.handle_mouse_event(&diag_mouse(MouseEventType::Release, grab_col, 12), 1);
+    }
+}
+
 #[test]
 fn suppressed_plugin_panes_get_mode_updates_but_are_not_visible() {
     let (mut tab, plugin_receiver) = tab_with_floating_plugin_pane(1);
@@ -21467,6 +22282,47 @@ pub fn get_edge_at_position_reports_the_border_under_the_cursor() {
 
     // outside the pane
     assert_eq!(at(x + cols, mid_line), None);
+}
+
+/// Grabbing an actual pane corner should still resize both axes at once.
+#[test]
+pub fn diag_corner_drag_still_resizes_both_axes() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_grid_tab(size, 2, 3);
+    diag_print("initial", &tab);
+    let (xs, ys) = diag_boundaries(&tab);
+    println!("boundaries x {:?} y {:?}", xs, ys);
+    // top-left corner of the middle pane in the right column
+    let (corner_col, corner_line) = (xs[1], ys[1] as isize);
+    println!("grabbing corner col={} line={}", corner_col, corner_line);
+    tab.handle_mouse_event(
+        &diag_mouse(MouseEventType::Press, corner_col, corner_line),
+        1,
+    )
+    .unwrap();
+    for step in 1..=5 {
+        tab.handle_mouse_event(
+            &diag_mouse(
+                MouseEventType::Motion,
+                corner_col - step,
+                corner_line - step as isize,
+            ),
+            1,
+        )
+        .unwrap();
+        let (xs, ys) = diag_boundaries(&tab);
+        println!(
+            "motion col={} line={} -> x {:?} y {:?}",
+            corner_col - step,
+            corner_line - step as isize,
+            xs,
+            ys
+        );
+    }
+    diag_print("final", &tab);
 }
 
 fn drag_border_and_return_boundary(

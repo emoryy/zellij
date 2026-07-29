@@ -22730,3 +22730,186 @@ pub fn dragging_a_divider_moves_only_that_divider() {
         }
     }
 }
+
+/// Every cell of the tiled area must be covered by exactly one pane. Returns the cells that
+/// are covered by none (dead zones) and the ones covered by more than one.
+fn diag_tiling_faults(tab: &Tab, size: Size) -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    let mut coverage = vec![vec![0usize; size.cols]; size.rows];
+    for (_pid, pane) in tab.tiled_panes.panes.iter() {
+        let g = pane.position_and_size();
+        for y in g.y..(g.y + g.rows.as_usize()).min(size.rows) {
+            for x in g.x..(g.x + g.cols.as_usize()).min(size.cols) {
+                coverage[y][x] += 1;
+            }
+        }
+    }
+    let mut gaps = vec![];
+    let mut overlaps = vec![];
+    for (y, row) in coverage.iter().enumerate() {
+        for (x, count) in row.iter().enumerate() {
+            match count {
+                0 => gaps.push((x, y)),
+                1 => {},
+                _ => overlaps.push((x, y)),
+            }
+        }
+    }
+    (gaps, overlaps)
+}
+
+fn diag_quad_tab(size: Size) -> Tab {
+    let mut top = TiledPaneLayout::default();
+    top.children_split_direction = SplitDirection::Vertical;
+    top.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut bottom = TiledPaneLayout::default();
+    bottom.children_split_direction = SplitDirection::Vertical;
+    bottom.children = vec![TiledPaneLayout::default(), TiledPaneLayout::default()];
+    let mut root = TiledPaneLayout::default();
+    root.children_split_direction = SplitDirection::Horizontal;
+    root.children = vec![top, bottom];
+    create_new_tab_with_layout(size, root)
+}
+
+/// Grab the corner where four panes meet and swing the cursor around it, the way a hand
+/// does when it wanders while a border is held.
+#[test]
+pub fn diag_circling_a_corner_keeps_the_layout_tiled() {
+    let size = Size {
+        cols: 121,
+        rows: 30,
+    };
+    let mut tab = diag_quad_tab(size);
+    diag_print("initial", &tab);
+    let (xs, ys) = diag_boundaries(&tab);
+    let (corner_col, corner_line) = (xs[1], ys[1] as isize);
+    println!(
+        "grabbing the corner at col={} line={}",
+        corner_col, corner_line
+    );
+    tab.handle_mouse_event(
+        &diag_mouse(MouseEventType::Press, corner_col, corner_line),
+        1,
+    )
+    .unwrap();
+
+    // a circle around the grab point
+    let ring: Vec<(isize, isize)> = vec![
+        (1, 0),
+        (2, 1),
+        (2, 2),
+        (1, 3),
+        (0, 3),
+        (-1, 2),
+        (-2, 1),
+        (-2, 0),
+        (-2, -1),
+        (-1, -2),
+        (0, -2),
+        (1, -1),
+        (1, 0),
+    ];
+    let mut faults = 0;
+    for lap in 0..3 {
+        for (dx, dy) in &ring {
+            let col = (corner_col as isize + dx).max(1) as usize;
+            let line = (corner_line + dy).max(1);
+            tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, line), 1)
+                .unwrap();
+            let (gaps, overlaps) = diag_tiling_faults(&tab, size);
+            if lap == 0 {
+                let (xs_now, ys_now) = diag_boundaries(&tab);
+                println!(
+                    "  cursor ({:>3},{:>3}) -> x {:?} y {:?}",
+                    col, line, xs_now, ys_now
+                );
+            }
+            if !gaps.is_empty() || !overlaps.is_empty() {
+                faults += 1;
+                if faults <= 3 {
+                    println!(
+                        "lap {} cursor ({}, {}): {} dead cells {:?}, {} overlapping cells {:?}",
+                        lap,
+                        col,
+                        line,
+                        gaps.len(),
+                        &gaps[..gaps.len().min(8)],
+                        overlaps.len(),
+                        &overlaps[..overlaps.len().min(8)]
+                    );
+                }
+            }
+        }
+    }
+    println!("events with a broken tiling: {}", faults);
+    diag_print("final", &tab);
+}
+
+/// Wandering the cursor around while a border is held must never leave a cell uncovered or
+/// covered twice, whichever border was grabbed.
+#[test]
+pub fn dragging_never_breaks_the_tiling() {
+    let ring: Vec<(isize, isize)> = vec![
+        (1, 0),
+        (2, 1),
+        (2, 2),
+        (1, 3),
+        (0, 3),
+        (-1, 2),
+        (-2, 1),
+        (-2, 0),
+        (-2, -1),
+        (-1, -2),
+        (0, -2),
+        (1, -1),
+    ];
+
+    for (cols, rows) in [(121usize, 30usize), (121, 37), (80, 24), (200, 50)] {
+        let size = Size { cols, rows };
+        for (columns, panes_per_column) in [(2usize, 2usize), (2, 3), (3, 3)] {
+            // grab every border crossing and corner in the layout in turn
+            let grab_points: Vec<(usize, isize)> = {
+                let tab = diag_grid_tab(size, columns, panes_per_column);
+                let (xs, ys) = diag_boundaries(&tab);
+                let mut points = vec![];
+                for x in xs.iter().skip(1) {
+                    for y in ys.iter() {
+                        points.push((*x, *y as isize));
+                        points.push((*x, *y as isize + 2));
+                    }
+                }
+                for y in ys.iter().skip(1) {
+                    points.push((5, *y as isize));
+                }
+                points
+            };
+
+            for (grab_col, grab_line) in grab_points {
+                let mut tab = diag_grid_tab(size, columns, panes_per_column);
+                tab.handle_mouse_event(&diag_mouse(MouseEventType::Press, grab_col, grab_line), 1)
+                    .unwrap();
+                for lap in 0..2 {
+                    for (dx, dy) in &ring {
+                        let col = (grab_col as isize + dx).clamp(1, cols as isize - 2) as usize;
+                        let line = (grab_line + dy).clamp(1, rows as isize - 2);
+                        tab.handle_mouse_event(&diag_mouse(MouseEventType::Motion, col, line), 1)
+                            .unwrap();
+                        let (gaps, overlaps) = diag_tiling_faults(&tab, size);
+                        assert!(
+                            gaps.is_empty() && overlaps.is_empty(),
+                            "{cols}x{rows}, {columns} columns of {panes_per_column}, grabbed \
+                             ({grab_col}, {grab_line}), lap {lap} cursor ({col}, {line}): \
+                             {} dead cells, {} overlapping cells",
+                            gaps.len(),
+                            overlaps.len()
+                        );
+                    }
+                }
+                tab.handle_mouse_event(
+                    &diag_mouse(MouseEventType::Release, grab_col, grab_line),
+                    1,
+                )
+                .unwrap();
+            }
+        }
+    }
+}

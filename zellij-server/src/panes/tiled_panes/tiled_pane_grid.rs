@@ -575,24 +575,25 @@ impl<'a> TiledPaneGrid<'a> {
     /// Returns how many cells the boundary actually moved: less than asked for when a pane on
     /// the shrinking side runs into its minimum size.
     ///
-    /// Takes one move per axis at a time, because which panes sit at a boundary has to be
-    /// worked out from the geometry as it is *before* any of the moves: moving one axis first
-    /// would change the answer for the other one.
+    /// Takes one move per axis. Each is planned against the geometry left by the previous
+    /// one, never against the geometry from before them all: moving a border along one axis
+    /// changes which panes sit at the border on the other axis, and planning both up front
+    /// makes the two moves claim overlapping territory around their shared corner, which
+    /// leaves cells covered twice or not at all.
     pub fn move_pane_boundaries(
         &mut self,
         pane_id: &PaneId,
         moves: &[(Direction, isize)],
     ) -> Result<isize> {
-        let mut plans = vec![];
-        for (edge, cells) in moves {
-            match self.plan_boundary_move(pane_id, *edge, *cells) {
-                Ok(Some(plan)) => plans.push(plan),
-                // a fixed-size pane in the way blocks this axis, the other one can still move
-                Ok(None) | Err(_) => {},
-            }
-        }
         let mut moved = 0;
-        for (axis, before, after, cells) in plans {
+        for (edge, cells) in moves {
+            let plan = match self.plan_boundary_move(pane_id, *edge, *cells) {
+                Ok(Some(plan)) => plan,
+                // nothing to move, or a fixed-size pane in the way: the other axis can still
+                // move
+                Ok(None) | Err(_) => continue,
+            };
+            let (axis, before, after, cells) = plan;
             for pane_id in before.iter() {
                 self.move_pane_geom(pane_id, axis, 0, cells)?;
             }
@@ -602,6 +603,38 @@ impl<'a> TiledPaneGrid<'a> {
             moved += cells.abs();
         }
         Ok(moved)
+    }
+
+    /// The interval the given panes span across the axis they are *not* being resized along,
+    /// but only if they tile it end to end. `None` means they do not form one unbroken side
+    /// of a border, in which case moving that border would tear the layout.
+    fn perpendicular_extent(
+        &self,
+        pane_ids: &[PaneId],
+        axis: SplitDirection,
+    ) -> Option<(usize, usize)> {
+        let mut intervals: Vec<(usize, usize)> = vec![];
+        for pane_id in pane_ids {
+            let geom = self.get_pane_geom(pane_id)?;
+            let interval = match axis {
+                // resizing widths, so the panes have to tile a range of rows
+                SplitDirection::Horizontal => (geom.y, geom.y + geom.rows.as_usize()),
+                SplitDirection::Vertical => (geom.x, geom.x + geom.cols.as_usize()),
+            };
+            if !intervals.contains(&interval) {
+                intervals.push(interval);
+            }
+        }
+        intervals.sort_unstable();
+        let (first, _) = *intervals.first()?;
+        let mut end = first;
+        for (start, stop) in intervals {
+            if start != end {
+                return None;
+            }
+            end = stop;
+        }
+        Some((first, end))
     }
 
     #[allow(clippy::type_complexity)]
@@ -675,6 +708,17 @@ impl<'a> TiledPaneGrid<'a> {
         } else {
             SplitDirection::Vertical
         };
+
+        // both sides have to be one unbroken run covering the same stretch of the border,
+        // otherwise moving them by the same amount would leave a hole or an overlap
+        match (
+            self.perpendicular_extent(&before, axis),
+            self.perpendicular_extent(&after, axis),
+        ) {
+            (Some(before_extent), Some(after_extent)) if before_extent == after_extent => {},
+            _ => return Ok(None),
+        }
+
         let fixed_panes: Vec<(u32, bool)> = before
             .iter()
             .chain(after.iter())

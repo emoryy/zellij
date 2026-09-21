@@ -751,6 +751,7 @@ pub enum BackgroundJobContext {
     SessionSuggestions,
     SessionPreview,
     SavedSessionPreview,
+    SerializeSessionLayout,
     Exit,
 }
 

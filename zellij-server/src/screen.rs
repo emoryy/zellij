@@ -7009,6 +7009,17 @@ impl Screen {
             .send_to_background_jobs(BackgroundJob::QueryZellijWebServerStatus)
             .with_context(err_context)?;
 
+        // This is the canonical "the session state changed" hook, so it is also where we ask for
+        // the resurrection layout to be written. The background job debounces, so a burst of
+        // changes costs one serialization. Without this the layout only reached the disk on the
+        // periodic timer, and anything done since the last tick was lost on an unclean shutdown.
+        if self.session_serialization {
+            self.bus
+                .senders
+                .send_to_background_jobs(BackgroundJob::SerializeSessionLayout)
+                .with_context(err_context)?;
+        }
+
         self.report_mobile_state();
         Ok(())
     }

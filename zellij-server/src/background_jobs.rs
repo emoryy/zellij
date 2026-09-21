@@ -105,6 +105,7 @@ pub enum BackgroundJob {
         client_id: ClientId,
         session_name: String,
     },
+    SerializeSessionLayout,
     Exit,
 }
 
@@ -146,6 +147,7 @@ impl From<&BackgroundJob> for BackgroundJobContext {
             BackgroundJob::SessionSuggestions(..) => BackgroundJobContext::SessionSuggestions,
             BackgroundJob::SessionPreview { .. } => BackgroundJobContext::SessionPreview,
             BackgroundJob::SavedSessionPreview { .. } => BackgroundJobContext::SavedSessionPreview,
+            BackgroundJob::SerializeSessionLayout => BackgroundJobContext::SerializeSessionLayout,
             BackgroundJob::Exit => BackgroundJobContext::Exit,
         }
     }
@@ -298,6 +300,10 @@ fn spawn_render_scheduler(senders: crate::thread_bus::ThreadSenders) -> SharedRe
 }
 
 static HELP_TEXT_DEBOUNCE_DURATION: u64 = 5000;
+// How long the session state has to stay unchanged before we serialize it for resurrection.
+// Long enough that holding down a "move tab" key or dragging a pane border collapses into a
+// single serialization, short enough that an unclean shutdown loses very little.
+static LAYOUT_SERIALIZATION_DEBOUNCE_MS: u64 = 1500;
 static COMMAND_OUTPUT_FLASH_DURATION_MS: u64 = 400;
 
 #[derive(Clone)]
@@ -344,6 +350,7 @@ pub(crate) fn background_jobs_main(
         Arc::new(Mutex::new(HashMap::new()));
     let pending_command_output_flash_clear: Arc<Mutex<HashMap<PaneId, Instant>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    let pending_layout_serialization: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let mut flashing_pane_bells: HashMap<PaneId, Arc<AtomicBool>> = HashMap::new();
     let mut flashing_tab_bells: HashMap<usize, Arc<AtomicBool>> = HashMap::new();
     let mut nested_guest_pings: HashMap<PaneId, Arc<AtomicBool>> = HashMap::new();
@@ -729,6 +736,63 @@ pub(crate) fn background_jobs_main(
                                     None => {
                                         let _ = senders.send_to_server(
                                             ServerInstruction::ClearMouseHelpText(client_id),
+                                        );
+                                        break;
+                                    },
+                                }
+                            }
+                        }
+                    });
+                }
+            },
+            BackgroundJob::SerializeSessionLayout => {
+                // Trailing debounce: every state change re-arms the timer, and only once the
+                // state has been quiet for LAYOUT_SERIALIZATION_DEBOUNCE_MS do we actually
+                // serialize. This keeps a burst of changes (a held-down move-tab key, a pane
+                // border drag) down to one serialization.
+                let should_spawn = {
+                    let mut pending = pending_layout_serialization.lock().unwrap();
+                    let should_spawn = pending.is_none();
+                    *pending = Some(Instant::now());
+                    should_spawn
+                };
+
+                if should_spawn {
+                    runtime.spawn({
+                        let senders = bus.senders.clone();
+                        let pending = pending_layout_serialization.clone();
+                        let debounce_duration =
+                            Duration::from_millis(LAYOUT_SERIALIZATION_DEBOUNCE_MS);
+                        async move {
+                            tokio::time::sleep(debounce_duration).await;
+                            loop {
+                                let next_sleep_duration = {
+                                    let mut pending = pending.lock().unwrap();
+                                    match *pending {
+                                        Some(last_change_time) => {
+                                            let time_since_change =
+                                                Instant::now().duration_since(last_change_time);
+                                            if time_since_change >= debounce_duration {
+                                                *pending = None;
+                                                None
+                                            } else {
+                                                Some(
+                                                    debounce_duration
+                                                        .saturating_sub(time_since_change),
+                                                )
+                                            }
+                                        },
+                                        None => break,
+                                    }
+                                };
+
+                                match next_sleep_duration {
+                                    Some(duration) => {
+                                        tokio::time::sleep(duration).await;
+                                    },
+                                    None => {
+                                        let _ = senders.send_to_screen(
+                                            ScreenInstruction::SerializeLayoutForResurrection,
                                         );
                                         break;
                                     },
